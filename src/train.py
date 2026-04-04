@@ -46,11 +46,14 @@ class TrainConfig:
     batch_size: int = 8
     lr: float = 1e-3
     weight_decay: float = 1e-5
-    epochs: int = 3
+    epochs: int = 20
     num_workers: int = 0
     dropout: float = 0.1
     max_grad_norm: float = 1.0
     log_interval: int = 200
+    early_stopping_min_epochs: int = 3
+    early_stopping_patience: int = 10
+    early_stopping_min_delta: float = 1e-3
 
     use_wandb: bool = True
     wandb_project: str = "mind"
@@ -343,8 +346,9 @@ def main() -> None:
         trainable_params=trainable_params,
     )
 
-    best_dev_mrr = -1.0
+    best_dev_mrr = float("-inf")
     global_step = 0
+    epochs_without_improvement = 0
 
     try:
         for epoch in range(1, config.epochs + 1):
@@ -400,7 +404,11 @@ def main() -> None:
 
             train_loss = running_loss / max(running_valid_candidates, 1)
             dev_metrics = evaluate(model, dev_loader, criterion, device)
-            is_best_checkpoint = dev_metrics["MRR"] > best_dev_mrr
+            current_dev_mrr = dev_metrics["MRR"]
+            is_best_checkpoint = current_dev_mrr > best_dev_mrr
+            has_meaningful_improvement = current_dev_mrr > (
+                best_dev_mrr + config.early_stopping_min_delta
+            )
 
             print(
                 f"[epoch {epoch}] "
@@ -413,7 +421,7 @@ def main() -> None:
             )
 
             if is_best_checkpoint:
-                best_dev_mrr = dev_metrics["MRR"]
+                best_dev_mrr = current_dev_mrr
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
@@ -429,6 +437,18 @@ def main() -> None:
                     wandb_run.summary["best/epoch"] = epoch
                     wandb_run.summary["best/checkpoint_path"] = str(config.checkpoint_path)
 
+            if epoch >= config.early_stopping_min_epochs:
+                if has_meaningful_improvement:
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+
+                print(
+                    "early stopping monitor: "
+                    f"{epochs_without_improvement}/{config.early_stopping_patience} "
+                    f"epochs without dev_MRR improvement > {config.early_stopping_min_delta:.4f}"
+                )
+
             if wandb_run is not None:
                 wandb_run.log(
                     {
@@ -441,8 +461,22 @@ def main() -> None:
                         "epoch/dev_nDCG@10": dev_metrics["nDCG@10"],
                         "epoch/best_dev_MRR": best_dev_mrr,
                         "epoch/is_best_checkpoint": int(is_best_checkpoint),
+                        "epoch/has_meaningful_improvement": int(has_meaningful_improvement),
+                        "epoch/epochs_without_improvement": epochs_without_improvement,
                     }
                 )
+
+            should_early_stop = (
+                epoch >= config.early_stopping_min_epochs
+                and epochs_without_improvement >= config.early_stopping_patience
+            )
+            if should_early_stop:
+                print(
+                    "early stopping triggered: "
+                    f"dev_MRR did not improve by more than {config.early_stopping_min_delta:.4f} "
+                    f"for {config.early_stopping_patience} consecutive epochs."
+                )
+                break
     finally:
         if wandb_run is not None:
             wandb_run.finish()
