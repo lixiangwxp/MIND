@@ -214,7 +214,7 @@ class BaselineNewsRecModel(nn.Module):
             "title_token_mask": self.news_title_mask[news_ids],
         }
 
-        if self.use_entities:
+        if self.use_entities:#如果模型启用了 entity 特征，就把“这些新闻对应的实体特征”也一起查出来。
             features["entity_ids"] = self.news_entity_ids[news_ids]
             features["entity_mask"] = self.news_entity_mask[news_ids]
 
