@@ -1,0 +1,13 @@
+data/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.parquet
+*.npy
+__pycache__/
+.DS_Store
+.env
+.venv/
+outputs/wandb/
+wandb/
