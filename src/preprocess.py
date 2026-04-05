@@ -136,18 +136,29 @@ def _sample_candidates(
     candidate_news_ids: list[str],
     candidate_labels: list[int],
     negative_sample_size: int | None,
+    negative_sample_ratio: int | None,
+    negative_sample_max_size: int | None,
     rng: random.Random,
 ) -> tuple[list[str], list[int]]:
-    if negative_sample_size is None or negative_sample_size < 0:
-        return candidate_news_ids, candidate_labels
-
     pos_indices = [idx for idx, label in enumerate(candidate_labels) if label == 1]
     neg_indices = [idx for idx, label in enumerate(candidate_labels) if label == 0]
 
-    if len(neg_indices) <= negative_sample_size:
+    if negative_sample_ratio is not None and negative_sample_ratio > 0:
+        target_negative_count = len(pos_indices) * negative_sample_ratio
+    elif negative_sample_size is not None and negative_sample_size >= 0:
+        target_negative_count = negative_sample_size
+    else:
+        return candidate_news_ids, candidate_labels
+
+    if negative_sample_max_size is not None and negative_sample_max_size > 0:
+        target_negative_count = min(target_negative_count, negative_sample_max_size)
+
+    if target_negative_count <= 0:
+        selected_indices = pos_indices if pos_indices else list(range(len(candidate_news_ids)))
+    elif len(neg_indices) <= target_negative_count:
         selected_indices = list(range(len(candidate_news_ids)))
     else:
-        sampled_neg_indices = rng.sample(neg_indices, negative_sample_size)
+        sampled_neg_indices = rng.sample(neg_indices, target_negative_count)
         selected_indices = sorted(pos_indices + sampled_neg_indices)
 
     sampled_news_ids = [candidate_news_ids[idx] for idx in selected_indices]
@@ -159,6 +170,8 @@ def build_impression_samples(
     behaviors_df: pd.DataFrame,
     max_history_len: int | None = 50,
     negative_sample_size: int | None = None,
+    negative_sample_ratio: int | None = None,
+    negative_sample_max_size: int | None = None,
     random_seed: int = 42,
 ) -> list[dict[str, Any]]:
     rng = random.Random(random_seed)
@@ -170,6 +183,8 @@ def build_impression_samples(
             row.candidate_news_ids,
             row.labels,
             negative_sample_size,
+            negative_sample_ratio,
+            negative_sample_max_size,
             rng,
         )
 
@@ -250,7 +265,9 @@ def save_processed_artifacts(
     max_title_len: int = 24,
     max_entity_len: int = 5,
     title_only: bool = True,
-    train_negative_sample_size: int | None = 4,
+    train_negative_sample_size: int | None = None,
+    train_negative_sample_ratio: int | None = 8,
+    train_negative_sample_max_size: int | None = 24,
     dev_negative_sample_size: int | None = None,
     random_seed: int = 42,
 ) -> dict[str, Any]:
@@ -276,6 +293,8 @@ def save_processed_artifacts(
         train_behaviors_df,
         max_history_len=max_history_len,
         negative_sample_size=train_negative_sample_size,
+        negative_sample_ratio=train_negative_sample_ratio,
+        negative_sample_max_size=train_negative_sample_max_size,
         random_seed=random_seed,
     )
     dev_samples = build_impression_samples(
@@ -311,6 +330,8 @@ def save_processed_artifacts(
         "max_entity_len": max_entity_len,
         "title_only": title_only,
         "train_negative_sample_size": train_negative_sample_size,
+        "train_negative_sample_ratio": train_negative_sample_ratio,
+        "train_negative_sample_max_size": train_negative_sample_max_size,
         "dev_negative_sample_size": dev_negative_sample_size,
         "random_seed": random_seed,
         "news_count": len(news_dict),
@@ -375,8 +396,20 @@ def main() -> None:
     parser.add_argument(
         "--train-negative-sample-size",
         type=int,
-        default=4,
-        help="Sample at most N negative candidates per training impression.",
+        default=None,
+        help="Fallback fixed-count negative sampling for training. Ignored when ratio > 0.",
+    )
+    parser.add_argument(
+        "--train-negative-sample-ratio",
+        type=int,
+        default=8,
+        help="Target negative-to-positive sampling ratio for training. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--train-negative-sample-max-size",
+        type=int,
+        default=24,
+        help="Maximum number of negative candidates kept per training impression.",
     )
     parser.add_argument(
         "--dev-negative-sample-size",
@@ -401,6 +434,8 @@ def main() -> None:
         max_entity_len=args.max_entity_len,
         title_only=args.title_only,
         train_negative_sample_size=args.train_negative_sample_size,
+        train_negative_sample_ratio=args.train_negative_sample_ratio,
+        train_negative_sample_max_size=args.train_negative_sample_max_size,
         dev_negative_sample_size=args.dev_negative_sample_size,
         random_seed=args.random_seed,
     )

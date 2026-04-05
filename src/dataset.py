@@ -14,6 +14,15 @@ except ImportError:  # pragma: no cover - used in data-only environments
         pass
 
 PAD_NEWS_ID = "<PAD>"
+BUCKET_ORDER = ("short", "medium", "long")
+
+
+def get_candidate_bucket(candidate_len: int) -> str:
+    if candidate_len <= 10:
+        return "short"
+    if candidate_len <= 24:
+        return "medium"
+    return "long"
 
 
 def build_news_id_mapping(
@@ -149,3 +158,39 @@ def build_dataloader(
         collate_fn=collator,
         drop_last=drop_last,
     )
+
+
+def build_bucketed_dataloaders(
+    impression_samples: Sequence[Mapping[str, Any]],
+    news_id_to_index: Mapping[str, int],
+    batch_sizes: Mapping[str, int],
+    shuffle: bool,
+    num_workers: int = 0,
+    pad_news_index: int = 0,
+    label_pad_value: float = -100.0,
+    drop_last: bool = False,
+) -> dict[str, DataLoader]:
+    buckets: dict[str, list[Mapping[str, Any]]] = {name: [] for name in BUCKET_ORDER}
+
+    for sample in impression_samples:
+        bucket_name = get_candidate_bucket(len(sample.get("candidates", [])))
+        buckets[bucket_name].append(sample)
+
+    dataloaders: dict[str, DataLoader] = {}
+    for bucket_name in BUCKET_ORDER:
+        samples = buckets[bucket_name]
+        if not samples:
+            continue
+
+        dataloaders[bucket_name] = build_dataloader(
+            impression_samples=samples,
+            news_id_to_index=news_id_to_index,
+            batch_size=batch_sizes[bucket_name],
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pad_news_index=pad_news_index,
+            label_pad_value=label_pad_value,
+            drop_last=drop_last,
+        )
+
+    return dataloaders

@@ -39,7 +39,7 @@ class NewsEncoder(nn.Module):
         self.subcategory_embedding = nn.Embedding(num_subcategories, subcategory_dim, padding_idx=0)
         self.token_embedding = nn.Embedding(vocab_size, token_dim, padding_idx=0)
 
-        input_dim = category_dim + subcategory_dim + token_dim
+        input_dim = category_dim + subcategory_dim + token_dim + token_dim
 
         if self.use_entities:
             self.entity_embedding = nn.Embedding(num_entities, entity_dim, padding_idx=0)
@@ -60,12 +60,15 @@ class NewsEncoder(nn.Module):
         subcategory_ids: torch.Tensor,
         title_token_ids: torch.Tensor,
         title_token_mask: torch.Tensor,
+        abstract_token_ids: torch.Tensor,
+        abstract_token_mask: torch.Tensor,
         entity_ids: Optional[torch.Tensor] = None,
         entity_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         category_ids: [B, L] or [B, K]
         title_token_ids: [B, L, T] or [B, K, T]
+        abstract_token_ids: [B, L, A] or [B, K, A]
         returns:
             news_vecs: [B, L, D] or [B, K, D]
         """
@@ -76,14 +79,18 @@ class NewsEncoder(nn.Module):
         flat_subcategory_ids = subcategory_ids.reshape(-1)
         flat_title_token_ids = title_token_ids.reshape(flat_size, title_token_ids.size(-1))
         flat_title_token_mask = title_token_mask.reshape(flat_size, title_token_mask.size(-1))
+        flat_abstract_token_ids = abstract_token_ids.reshape(flat_size, abstract_token_ids.size(-1))
+        flat_abstract_token_mask = abstract_token_mask.reshape(flat_size, abstract_token_mask.size(-1))
 
         category_vec = self.category_embedding(flat_category_ids)
         subcategory_vec = self.subcategory_embedding(flat_subcategory_ids)
 
         title_token_vecs = self.token_embedding(flat_title_token_ids)
         title_vec = masked_mean_pool(title_token_vecs, flat_title_token_mask)
+        abstract_token_vecs = self.token_embedding(flat_abstract_token_ids)
+        abstract_vec = masked_mean_pool(abstract_token_vecs, flat_abstract_token_mask)
 
-        features = [category_vec, subcategory_vec, title_vec]
+        features = [category_vec, subcategory_vec, title_vec, abstract_vec]
 
         if self.use_entities:
             if entity_ids is None or entity_mask is None:
@@ -157,6 +164,8 @@ class BaselineNewsRecModel(nn.Module):
         news_subcategory_ids: torch.Tensor,
         news_title_token_ids: torch.Tensor,
         news_title_mask: torch.Tensor,
+        news_abstract_token_ids: torch.Tensor,
+        news_abstract_mask: torch.Tensor,
         num_entities: int = 0,
         news_entity_ids: Optional[torch.Tensor] = None,
         news_entity_mask: Optional[torch.Tensor] = None,
@@ -196,6 +205,8 @@ class BaselineNewsRecModel(nn.Module):
         self.register_buffer("news_subcategory_ids", news_subcategory_ids.long())
         self.register_buffer("news_title_token_ids", news_title_token_ids.long())
         self.register_buffer("news_title_mask", news_title_mask.bool())
+        self.register_buffer("news_abstract_token_ids", news_abstract_token_ids.long())
+        self.register_buffer("news_abstract_mask", news_abstract_mask.bool())
 
         if self.use_entities:
             if news_entity_ids is None or news_entity_mask is None:
@@ -212,9 +223,11 @@ class BaselineNewsRecModel(nn.Module):
             "subcategory_ids": self.news_subcategory_ids[news_ids],
             "title_token_ids": self.news_title_token_ids[news_ids],
             "title_token_mask": self.news_title_mask[news_ids],
+            "abstract_token_ids": self.news_abstract_token_ids[news_ids],
+            "abstract_token_mask": self.news_abstract_mask[news_ids],
         }
 
-        if self.use_entities:#如果模型启用了 entity 特征，就把“这些新闻对应的实体特征”也一起查出来。
+        if self.use_entities:
             features["entity_ids"] = self.news_entity_ids[news_ids]
             features["entity_mask"] = self.news_entity_mask[news_ids]
 
@@ -228,6 +241,8 @@ class BaselineNewsRecModel(nn.Module):
             subcategory_ids=features["subcategory_ids"],
             title_token_ids=features["title_token_ids"],
             title_token_mask=features["title_token_mask"],
+            abstract_token_ids=features["abstract_token_ids"],
+            abstract_token_mask=features["abstract_token_mask"],
             entity_ids=features.get("entity_ids"),
             entity_mask=features.get("entity_mask"),
         )

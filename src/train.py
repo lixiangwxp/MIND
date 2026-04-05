@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,16 +10,17 @@ from typing import Any
 import pandas as pd
 import torch
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 try:
     import wandb
 except ImportError:
     wandb = None
 
-from dataset import build_dataloader
-from eval import auc_score, mrr_score, ndcg_at_k
+from dataset import BUCKET_ORDER, build_bucketed_dataloaders, build_dataloader
+from eval import auc_score, brier_score, mrr_score, ndcg_at_k, recall_at_k
 from featuresbaseline import load_or_build_baseline_news_features
-from losses import MaskedBCEWithLogitsLoss
+from losses import ImpressionPairwiseLoss, ListNetTop, MaskedBCEWithLogitsLoss
 from modelbaseline import BaselineNewsRecModel
 
 
@@ -42,18 +44,31 @@ class TrainConfig:
     checkpoint_path: Path = Path("outputs/baseline_best.pt")
 
     max_title_len: int = 24
+    max_abstract_len: int = 24
+    max_entity_len: int = 5
     embedding_dim: int = 128
     batch_size: int = 8
-    lr: float = 1e-3
+    bce_short_batch_size: int = 8
+    bce_medium_batch_size: int = 4
+    bce_long_batch_size: int = 2
+    pairwise_short_batch_size: int = 4
+    pairwise_medium_batch_size: int = 2
+    pairwise_long_batch_size: int = 1
+    lr: float = 5e-4
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 1
+    min_lr: float = 1e-6
     weight_decay: float = 1e-5
     epochs: int = 20
     num_workers: int = 0
     dropout: float = 0.1
     max_grad_norm: float = 1.0
     log_interval: int = 200
+    loss_type: str = "bce"
     early_stopping_min_epochs: int = 3
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 1e-3
+    use_entities: bool = True
 
     use_wandb: bool = True
     wandb_project: str = "mind"
@@ -94,6 +109,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Steps between console and W&B training logs.",
+    )
+    parser.add_argument(
+        "--loss-type",
+        type=str,
+        choices=["bce", "pairwise", "listnet_top"],
+        default=None,
+        help="Training loss to use. Default keeps the original BCE baseline.",
     )
     return parser.parse_args()
 
@@ -139,6 +161,34 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
         moved[key] = moved[key].to(device)
 
     return moved
+
+
+def build_criterion(loss_type: str) -> torch.nn.Module:
+    if loss_type == "bce":
+        return MaskedBCEWithLogitsLoss()
+
+    if loss_type == "pairwise":
+        return ImpressionPairwiseLoss()
+
+    if loss_type == "listnet_top":
+        return ListNetTop()
+
+    raise ValueError(f"Unsupported loss type: {loss_type}")
+
+
+def get_train_bucket_batch_sizes(config: TrainConfig, loss_type: str) -> dict[str, int]:
+    if loss_type == "pairwise":
+        return {
+            "short": config.pairwise_short_batch_size,
+            "medium": config.pairwise_medium_batch_size,
+            "long": config.pairwise_long_batch_size,
+        }
+
+    return {
+        "short": config.bce_short_batch_size,
+        "medium": config.bce_medium_batch_size,
+        "long": config.bce_long_batch_size,
+    }
 
 
 def count_parameters(model: torch.nn.Module) -> int:
@@ -194,6 +244,17 @@ def init_wandb_run(
     wandb.define_metric("train_step/*", step_metric="train_step/global_step")
     wandb.define_metric("epoch/index")
     wandb.define_metric("epoch/*", step_metric="epoch/index")
+    wandb.define_metric("epoch/dev_loss", step_metric="epoch/index")
+    wandb.define_metric("epoch/dev_MRR", step_metric="epoch/index")
+    wandb.define_metric("epoch/dev_nDCG@10", step_metric="epoch/index")
+    wandb.define_metric("epoch/dev_BrierScore", step_metric="epoch/index")
+    wandb.define_metric("epoch/dev_Recall@10", step_metric="epoch/index")
+    wandb.define_metric("epoch/dev_GlobalCTR", step_metric="epoch/index")
+    wandb.define_metric("epoch/dev_BrierRef", step_metric="epoch/index")
+    wandb.define_metric("epoch/ranking_score", step_metric="epoch/index")
+    wandb.define_metric("epoch/calibration_score", step_metric="epoch/index")
+    wandb.define_metric("epoch/selection_score", step_metric="epoch/index")
+    wandb.define_metric("epoch/lr", step_metric="epoch/index")
 
     run.summary["checkpoint_path"] = str(config.checkpoint_path)
 
@@ -208,7 +269,7 @@ def init_wandb_run(
 def evaluate(
     model: BaselineNewsRecModel,
     data_loader,
-    criterion: MaskedBCEWithLogitsLoss,
+    criterion: torch.nn.Module,
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
@@ -221,7 +282,11 @@ def evaluate(
     mrr_sum = 0.0
     ndcg5_sum = 0.0
     ndcg10_sum = 0.0
+    brier_error_sum = 0.0
+    brier_item_count = 0
+    recall10_sum = 0.0
     request_count = 0
+    total_positive_candidates = 0
 
     for batch in data_loader:
         batch = move_batch_to_device(batch, device)
@@ -246,6 +311,7 @@ def evaluate(
             scores_i = logits[i][mask_i].detach().cpu().tolist()
             labels_i = batch["labels"][i][mask_i].detach().cpu().tolist()
             labels_i = [int(x) for x in labels_i]
+            total_positive_candidates += sum(labels_i)
 
             request_count += 1
 
@@ -257,13 +323,30 @@ def evaluate(
             mrr_sum += mrr_score(scores_i, labels_i)
             ndcg5_sum += ndcg_at_k(scores_i, labels_i, k=5)
             ndcg10_sum += ndcg_at_k(scores_i, labels_i, k=10)
+            brier_error_sum += brier_score(scores_i, labels_i) * len(labels_i)
+            brier_item_count += len(labels_i)
+            recall10_sum += recall_at_k(scores_i, labels_i, k=10)
+
+    global_ctr = total_positive_candidates / max(total_valid_candidates, 1)
+    brier_score_value = brier_error_sum / max(brier_item_count, 1)
+    brier_ref = global_ctr * (1.0 - global_ctr)
+    calibration_score = max(0.0, 1.0 - (brier_score_value / brier_ref)) if brier_ref > 0 else 0.0
+    ranking_score = ndcg10_sum / max(request_count, 1)
+    selection_score = 0.5 * ranking_score + 0.5 * calibration_score
 
     return {
         "loss": total_loss / max(total_valid_candidates, 1),
         "AUC": auc_sum / max(auc_count, 1),
         "MRR": mrr_sum / max(request_count, 1),
         "nDCG@5": ndcg5_sum / max(request_count, 1),
-        "nDCG@10": ndcg10_sum / max(request_count, 1),
+        "nDCG@10": ranking_score,
+        "BrierScore": brier_score_value,
+        "Recall@10": recall10_sum / max(request_count, 1),
+        "GlobalCTR": global_ctr,
+        "BrierRef": brier_ref,
+        "CalibrationScore": calibration_score,
+        "RankingScore": ranking_score,
+        "SelectionScore": selection_score,
     }
 
 
@@ -281,6 +364,8 @@ def main() -> None:
         config.wandb_run_name = args.wandb_run_name
     if args.log_interval is not None:
         config.log_interval = args.log_interval
+    if args.loss_type:
+        config.loss_type = args.loss_type
     if config.log_interval < 1:
         raise ValueError("log_interval must be at least 1")
 
@@ -290,16 +375,19 @@ def main() -> None:
         cache_path=config.feature_cache_path,
         processed_dir=config.processed_dir,
         max_title_len=config.max_title_len,
+        max_abstract_len=config.max_abstract_len,
+        max_entity_len=config.max_entity_len,
     )
     news_id_to_index = load_json(config.news_id_to_index_path)
 
     train_samples = load_impression_samples(config.train_path)
     dev_samples = load_impression_samples(config.dev_path)
 
-    train_loader = build_dataloader(
+    train_bucket_batch_sizes = get_train_bucket_batch_sizes(config, config.loss_type)
+    train_loaders = build_bucketed_dataloaders(
         impression_samples=train_samples,
         news_id_to_index=news_id_to_index,
-        batch_size=config.batch_size,
+        batch_sizes=train_bucket_batch_sizes,
         shuffle=True,
         num_workers=config.num_workers,
     )
@@ -319,16 +407,28 @@ def main() -> None:
         news_subcategory_ids=features["news_subcategory_ids"],
         news_title_token_ids=features["news_title_token_ids"],
         news_title_mask=features["news_title_mask"],
+        news_abstract_token_ids=features["news_abstract_token_ids"],
+        news_abstract_mask=features["news_abstract_mask"],
+        num_entities=len(features["entity_to_index"]),
+        news_entity_ids=features["news_entity_ids"],
+        news_entity_mask=features["news_entity_mask"],
         embedding_dim=config.embedding_dim,
-        use_entities=False,
+        use_entities=config.use_entities,
         dropout=config.dropout,
     ).to(device)
 
-    criterion = MaskedBCEWithLogitsLoss()
+    criterion = build_criterion(config.loss_type)
     optimizer = AdamW(
         model.parameters(),
         lr=config.lr,
         weight_decay=config.weight_decay,
+    )
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=config.lr_scheduler_factor,
+        patience=config.lr_scheduler_patience,
+        min_lr=config.min_lr,
     )
     trainable_params = count_parameters(model)
 
@@ -338,6 +438,26 @@ def main() -> None:
     print(f"train samples = {len(train_samples)}")
     print(f"dev samples = {len(dev_samples)}")
     print(f"trainable params = {trainable_params:,}")
+    print(f"loss type = {config.loss_type}")
+    print(f"use entities = {config.use_entities}")
+    print(f"dev batch size = {config.batch_size}")
+    for bucket_name in BUCKET_ORDER:
+        loader = train_loaders.get(bucket_name)
+        if loader is None:
+            print(f"train bucket[{bucket_name}] samples=0 batch_size={train_bucket_batch_sizes[bucket_name]}")
+            continue
+
+        print(
+            f"train bucket[{bucket_name}] "
+            f"samples={len(loader.dataset)} batch_size={train_bucket_batch_sizes[bucket_name]} "
+            f"steps={len(loader)}"
+        )
+    print(
+        "lr scheduler = ReduceLROnPlateau("
+        f"mode=min, factor={config.lr_scheduler_factor}, "
+        f"patience={config.lr_scheduler_patience}, min_lr={config.min_lr}"
+        ")"
+    )
 
     wandb_run = init_wandb_run(
         config=config,
@@ -346,7 +466,7 @@ def main() -> None:
         trainable_params=trainable_params,
     )
 
-    best_dev_mrr = float("-inf")
+    best_selection_score = float("-inf")
     global_step = 0
     epochs_without_improvement = 0
 
@@ -356,58 +476,70 @@ def main() -> None:
 
             running_loss = 0.0
             running_valid_candidates = 0
-            num_train_steps = len(train_loader)
+            num_train_steps = sum(len(loader) for loader in train_loaders.values())
+            step = 0
+            epoch_bucket_order = list(BUCKET_ORDER)
+            random.Random(epoch).shuffle(epoch_bucket_order)
 
-            for step, batch in enumerate(train_loader, start=1):
-                batch = move_batch_to_device(batch, device)
+            for bucket_name in epoch_bucket_order:
+                train_loader = train_loaders.get(bucket_name)
+                if train_loader is None:
+                    continue
 
-                optimizer.zero_grad()
+                for batch in train_loader:
+                    step += 1
+                    batch = move_batch_to_device(batch, device)
 
-                outputs = model(
-                    history_ids=batch["history_ids"],
-                    history_mask=batch["history_mask"],
-                    candidate_ids=batch["candidate_ids"],
-                    candidate_mask=batch["candidate_mask"],
-                )
+                    optimizer.zero_grad()
 
-                loss = criterion(
-                    outputs["logits"],
-                    batch["labels"],
-                    batch["candidate_mask"],
-                )
+                    outputs = model(
+                        history_ids=batch["history_ids"],
+                        history_mask=batch["history_mask"],
+                        candidate_ids=batch["candidate_ids"],
+                        candidate_mask=batch["candidate_mask"],
+                    )
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                optimizer.step()
+                    loss = criterion(
+                        outputs["logits"],
+                        batch["labels"],
+                        batch["candidate_mask"],
+                    )
 
-                global_step += 1
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    optimizer.step()
 
-                valid_count = int(batch["candidate_mask"].sum().item())
-                running_loss += loss.item() * valid_count
-                running_valid_candidates += valid_count
+                    global_step += 1
 
-                should_log_step = step % config.log_interval == 0 or step == num_train_steps
-                if should_log_step:
-                    avg_train_loss = running_loss / max(running_valid_candidates, 1)
-                    print(f"[epoch {epoch}] step {step} train_loss={avg_train_loss:.4f}")
+                    valid_count = int(batch["candidate_mask"].sum().item())
+                    running_loss += loss.item() * valid_count
+                    running_valid_candidates += valid_count
 
-                    if wandb_run is not None:
-                        wandb_run.log(
-                            {
-                                "train_step/global_step": global_step,
-                                "train_step/epoch": epoch,
-                                "train_step/step_in_epoch": step,
-                                "train_step/loss": avg_train_loss,
-                                "train_step/lr": optimizer.param_groups[0]["lr"],
-                            }
+                    should_log_step = step % config.log_interval == 0 or step == num_train_steps
+                    if should_log_step:
+                        avg_train_loss = running_loss / max(running_valid_candidates, 1)
+                        print(
+                            f"[epoch {epoch}] step {step} "
+                            f"bucket={bucket_name} train_loss={avg_train_loss:.4f}"
                         )
+
+                        if wandb_run is not None:
+                            wandb_run.log(
+                                {
+                                    "train_step/global_step": global_step,
+                                    "train_step/epoch": epoch,
+                                    "train_step/step_in_epoch": step,
+                                    "train_step/loss": avg_train_loss,
+                                    "train_step/lr": optimizer.param_groups[0]["lr"],
+                                }
+                            )
 
             train_loss = running_loss / max(running_valid_candidates, 1)
             dev_metrics = evaluate(model, dev_loader, criterion, device)
-            current_dev_mrr = dev_metrics["MRR"]
-            is_best_checkpoint = current_dev_mrr > best_dev_mrr
-            has_meaningful_improvement = current_dev_mrr > (
-                best_dev_mrr + config.early_stopping_min_delta
+            current_selection_score = dev_metrics["SelectionScore"]
+            is_best_checkpoint = current_selection_score > best_selection_score
+            has_meaningful_improvement = current_selection_score > (
+                best_selection_score + config.early_stopping_min_delta
             )
 
             print(
@@ -417,11 +549,18 @@ def main() -> None:
                 f"AUC={dev_metrics['AUC']:.4f} "
                 f"MRR={dev_metrics['MRR']:.4f} "
                 f"nDCG@5={dev_metrics['nDCG@5']:.4f} "
-                f"nDCG@10={dev_metrics['nDCG@10']:.4f}"
+                f"nDCG@10={dev_metrics['nDCG@10']:.4f} "
+                f"BrierScore={dev_metrics['BrierScore']:.4f} "
+                f"Recall@10={dev_metrics['Recall@10']:.4f} "
+                f"selection_score={dev_metrics['SelectionScore']:.4f}"
             )
 
+            scheduler.step(dev_metrics["loss"])
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"[epoch {epoch}] lr={current_lr:.6g}")
+
             if is_best_checkpoint:
-                best_dev_mrr = current_dev_mrr
+                best_selection_score = current_selection_score
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
@@ -433,9 +572,12 @@ def main() -> None:
                 print(f"saved best checkpoint to {config.checkpoint_path}")
 
                 if wandb_run is not None:
-                    wandb_run.summary["best/dev_MRR"] = best_dev_mrr
+                    wandb_run.summary["best/selection_score"] = best_selection_score
                     wandb_run.summary["best/epoch"] = epoch
                     wandb_run.summary["best/checkpoint_path"] = str(config.checkpoint_path)
+                    wandb_run.summary["best/dev_nDCG@10"] = dev_metrics["nDCG@10"]
+                    wandb_run.summary["best/dev_BrierScore"] = dev_metrics["BrierScore"]
+                    wandb_run.summary["best/dev_Recall@10"] = dev_metrics["Recall@10"]
 
             if epoch >= config.early_stopping_min_epochs:
                 if has_meaningful_improvement:
@@ -446,7 +588,7 @@ def main() -> None:
                 print(
                     "early stopping monitor: "
                     f"{epochs_without_improvement}/{config.early_stopping_patience} "
-                    f"epochs without dev_MRR improvement > {config.early_stopping_min_delta:.4f}"
+                    f"epochs without selection_score improvement > {config.early_stopping_min_delta:.4f}"
                 )
 
             if wandb_run is not None:
@@ -459,12 +601,32 @@ def main() -> None:
                         "epoch/dev_MRR": dev_metrics["MRR"],
                         "epoch/dev_nDCG@5": dev_metrics["nDCG@5"],
                         "epoch/dev_nDCG@10": dev_metrics["nDCG@10"],
-                        "epoch/best_dev_MRR": best_dev_mrr,
+                        "epoch/dev_BrierScore": dev_metrics["BrierScore"],
+                        "epoch/dev_Recall@10": dev_metrics["Recall@10"],
+                        "epoch/dev_GlobalCTR": dev_metrics["GlobalCTR"],
+                        "epoch/dev_BrierRef": dev_metrics["BrierRef"],
+                        "epoch/ranking_score": dev_metrics["RankingScore"],
+                        "epoch/calibration_score": dev_metrics["CalibrationScore"],
+                        "epoch/selection_score": dev_metrics["SelectionScore"],
+                        "epoch/lr": current_lr,
+                        "epoch/best_selection_score": best_selection_score,
                         "epoch/is_best_checkpoint": int(is_best_checkpoint),
                         "epoch/has_meaningful_improvement": int(has_meaningful_improvement),
                         "epoch/epochs_without_improvement": epochs_without_improvement,
                     }
                 )
+                wandb_run.summary["latest/epoch"] = epoch
+                wandb_run.summary["latest/dev_loss"] = dev_metrics["loss"]
+                wandb_run.summary["latest/dev_MRR"] = dev_metrics["MRR"]
+                wandb_run.summary["latest/dev_nDCG@10"] = dev_metrics["nDCG@10"]
+                wandb_run.summary["latest/dev_BrierScore"] = dev_metrics["BrierScore"]
+                wandb_run.summary["latest/dev_Recall@10"] = dev_metrics["Recall@10"]
+                wandb_run.summary["latest/dev_GlobalCTR"] = dev_metrics["GlobalCTR"]
+                wandb_run.summary["latest/dev_BrierRef"] = dev_metrics["BrierRef"]
+                wandb_run.summary["latest/ranking_score"] = dev_metrics["RankingScore"]
+                wandb_run.summary["latest/calibration_score"] = dev_metrics["CalibrationScore"]
+                wandb_run.summary["latest/selection_score"] = dev_metrics["SelectionScore"]
+                wandb_run.summary["latest/lr"] = current_lr
 
             should_early_stop = (
                 epoch >= config.early_stopping_min_epochs
@@ -473,7 +635,7 @@ def main() -> None:
             if should_early_stop:
                 print(
                     "early stopping triggered: "
-                    f"dev_MRR did not improve by more than {config.early_stopping_min_delta:.4f} "
+                    f"selection_score did not improve by more than {config.early_stopping_min_delta:.4f} "
                     f"for {config.early_stopping_patience} consecutive epochs."
                 )
                 break
