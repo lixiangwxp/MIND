@@ -176,6 +176,14 @@ def build_criterion(loss_type: str) -> torch.nn.Module:
     raise ValueError(f"Unsupported loss type: {loss_type}")
 
 
+def get_loss_weight(loss_type: str, candidate_mask: torch.Tensor) -> int:
+    if loss_type == "listnet_top":
+        # Listwise loss is averaged per impression, not per candidate.
+        return int(candidate_mask.bool().any(dim=1).sum().item())
+
+    return int(candidate_mask.sum().item())
+
+
 def get_train_bucket_batch_sizes(config: TrainConfig, loss_type: str) -> dict[str, int]:
     if loss_type == "pairwise":
         return {
@@ -270,11 +278,13 @@ def evaluate(
     model: BaselineNewsRecModel,
     data_loader,
     criterion: torch.nn.Module,
+    loss_type: str,
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
 
     total_loss = 0.0
+    total_loss_weight = 0
     total_valid_candidates = 0
 
     auc_sum = 0.0
@@ -300,9 +310,13 @@ def evaluate(
 
         logits = outputs["logits"]
         loss = criterion(logits, batch["labels"], batch["candidate_mask"])
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite evaluation loss encountered.")
 
+        loss_weight = get_loss_weight(loss_type, batch["candidate_mask"])
         valid_count = int(batch["candidate_mask"].sum().item())
-        total_loss += loss.item() * valid_count
+        total_loss += loss.item() * loss_weight
+        total_loss_weight += loss_weight
         total_valid_candidates += valid_count
 
         batch_size = logits.size(0)
@@ -335,7 +349,7 @@ def evaluate(
     selection_score = 0.5 * ranking_score + 0.5 * calibration_score
 
     return {
-        "loss": total_loss / max(total_valid_candidates, 1),
+        "loss": total_loss / max(total_loss_weight, 1),
         "AUC": auc_sum / max(auc_count, 1),
         "MRR": mrr_sum / max(request_count, 1),
         "nDCG@5": ndcg5_sum / max(request_count, 1),
@@ -475,7 +489,7 @@ def main() -> None:
             model.train()
 
             running_loss = 0.0
-            running_valid_candidates = 0
+            running_loss_weight = 0
             num_train_steps = sum(len(loader) for loader in train_loaders.values())
             step = 0
             epoch_bucket_order = list(BUCKET_ORDER)
@@ -504,6 +518,11 @@ def main() -> None:
                         batch["labels"],
                         batch["candidate_mask"],
                     )
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError(
+                            f"Non-finite training loss encountered at epoch={epoch}, "
+                            f"step={step}, bucket={bucket_name}."
+                        )
 
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
@@ -511,13 +530,13 @@ def main() -> None:
 
                     global_step += 1
 
-                    valid_count = int(batch["candidate_mask"].sum().item())
-                    running_loss += loss.item() * valid_count
-                    running_valid_candidates += valid_count
+                    loss_weight = get_loss_weight(config.loss_type, batch["candidate_mask"])
+                    running_loss += loss.item() * loss_weight
+                    running_loss_weight += loss_weight
 
                     should_log_step = step % config.log_interval == 0 or step == num_train_steps
                     if should_log_step:
-                        avg_train_loss = running_loss / max(running_valid_candidates, 1)
+                        avg_train_loss = running_loss / max(running_loss_weight, 1)
                         print(
                             f"[epoch {epoch}] step {step} "
                             f"bucket={bucket_name} train_loss={avg_train_loss:.4f}"
@@ -534,8 +553,8 @@ def main() -> None:
                                 }
                             )
 
-            train_loss = running_loss / max(running_valid_candidates, 1)
-            dev_metrics = evaluate(model, dev_loader, criterion, device)
+            train_loss = running_loss / max(running_loss_weight, 1)
+            dev_metrics = evaluate(model, dev_loader, criterion, config.loss_type, device)
             current_selection_score = dev_metrics["SelectionScore"]
             is_best_checkpoint = current_selection_score > best_selection_score
             has_meaningful_improvement = current_selection_score > (

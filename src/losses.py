@@ -96,7 +96,6 @@ class ListNetTop(nn.Module):
         labels: torch.Tensor,
         candidate_mask: torch.Tensor,
     ) -> torch.Tensor:
-        
         valid_mask = candidate_mask.bool()
         valid_impressions = valid_mask.any(dim=1)
 
@@ -106,8 +105,8 @@ class ListNetTop(nn.Module):
         masked_logits = logits.masked_fill(~valid_mask, float("-inf"))
         masked_labels = labels.float().masked_fill(~valid_mask, float("-inf"))
 
-        pred_log_probs = F.log_softmax(masked_logits, dim=1)
-        target_probs = F.softmax(masked_labels, dim=1)
+        pred_log_probs = F.log_softmax(masked_logits, dim=1).masked_fill(~valid_mask, 0.0)
+        target_probs = F.softmax(masked_labels, dim=1).masked_fill(~valid_mask, 0.0)
 
         per_impression_loss = -(target_probs * pred_log_probs).sum(dim=1)
         valid_losses = per_impression_loss[valid_impressions]
@@ -119,4 +118,3 @@ class ListNetTop(nn.Module):
             return valid_losses.mean()
 
         raise ValueError(f"Unsupported reduction: {self.reduction}")
-
