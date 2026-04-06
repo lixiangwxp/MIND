@@ -215,9 +215,11 @@ class MultiHeadTargetAttentionUserEncoder(nn.Module):
                 value=valid_history,
                 key_padding_mask=~valid_history_mask,
                 need_weights=True,
-            )
+            )#attention_output 不是“candidate 本身”，而是“针对这个 candidate，从历史里聚合出来的一份相关历史信息”。
             user_states = self.norm1(valid_candidates + self.dropout(attention_output))
+            #做 LayerNorm让这一层输出更稳定，训练更容易收敛
             user_states = self.norm2(user_states + self.ffn(user_states))
+            #对刚刚融合完历史信息的 user_states 再做一次非线性变换和残差更新。
 
             user_vecs[valid_rows] = user_states
             attention_weights[valid_rows] = valid_attention_weights
@@ -236,11 +238,11 @@ class FeatureClickScorer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
-
+    #[B, K, 128]，[B, K, 128] -> [B, K, 128*4+1] -> [B, K, 1] -> [B, K]
     def forward(self, user_vecs: torch.Tensor, candidate_news_vecs: torch.Tensor) -> torch.Tensor:
         mul_feat = user_vecs * candidate_news_vecs
-        abs_diff_feat = torch.abs(user_vecs - candidate_news_vecs)
-        dot_feat = mul_feat.sum(dim=-1, keepdim=True)
+        abs_diff_feat = torch.abs(user_vecs - candidate_news_vecs)#按元素相乘，提取 user 和 candidate 在每个维度上的匹配信号。
+        dot_feat = mul_feat.sum(dim=-1, keepdim=True)#用户对这条候选新闻的整体兴趣强度。
 
         cross_features = torch.cat(
             [user_vecs, candidate_news_vecs, mul_feat, abs_diff_feat, dot_feat],
@@ -363,13 +365,14 @@ class FeatureNewsRecModel(nn.Module):
         candidate_ids: torch.Tensor,
         candidate_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        history_news_vecs = self.encode_news_batch(history_ids)
-        candidate_news_vecs = self.encode_news_batch(candidate_ids)
+        history_news_vecs = self.encode_news_batch(history_ids)##把当前 batch 里的候选历史新闻id，编码成候选新闻向量。
+        candidate_news_vecs = self.encode_news_batch(candidate_ids)#把当前 batch 里的候选新闻 id，编码成候选新闻向量。
+
         user_vecs, history_attention_weights = self.user_encoder(
             history_news_vecs=history_news_vecs,
             history_mask=history_mask,
             candidate_news_vecs=candidate_news_vecs,
-        )####target attention 真正发生的地方
+        )####target attention 真正发生的地方，用每个候选新闻去动态激活用户历史序列，从历史里提取最相关的信息，生成该候选对应的用户表示和注意力权重。
 
         logits = self.scorer(user_vecs, candidate_news_vecs)
         logits = logits.masked_fill(~candidate_mask, -1e9)

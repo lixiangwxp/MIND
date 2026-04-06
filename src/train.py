@@ -228,12 +228,24 @@ def build_checkpoint_path(model_type: str, loss_type: str) -> Path:
     return Path("outputs") / f"{model_type}_{loss_type}_best.pt"
 
 
-def get_loss_weight(loss_type: str, candidate_mask: torch.Tensor) -> int:
+def get_loss_weight(
+    loss_type: str,
+    candidate_mask: torch.Tensor,
+    labels: torch.Tensor,
+) -> int:
+    valid_mask = candidate_mask.bool()
+
     if loss_type == "listnet_top":
         # Listwise loss is averaged per impression, not per candidate.
-        return int(candidate_mask.bool().any(dim=1).sum().item())
+        return int(valid_mask.any(dim=1).sum().item())
 
-    return int(candidate_mask.sum().item())
+    if loss_type == "pairwise":
+        # Pairwise loss is averaged per clicked-vs-non-clicked pair.
+        pos_count = ((labels == 1) & valid_mask).sum(dim=1)
+        neg_count = ((labels == 0) & valid_mask).sum(dim=1)
+        return int((pos_count * neg_count).sum().item())
+
+    return int(valid_mask.sum().item())
 
 
 def get_train_bucket_batch_sizes(config: TrainConfig, loss_type: str) -> dict[str, int]:
@@ -365,7 +377,7 @@ def evaluate(
         if not torch.isfinite(loss):
             raise FloatingPointError("Non-finite evaluation loss encountered.")
 
-        loss_weight = get_loss_weight(loss_type, batch["candidate_mask"])
+        loss_weight = get_loss_weight(loss_type, batch["candidate_mask"], batch["labels"])
         valid_count = int(batch["candidate_mask"].sum().item())
         total_loss += loss.item() * loss_weight
         total_loss_weight += loss_weight
@@ -605,11 +617,12 @@ def main() -> None:
                         candidate_ids=batch["candidate_ids"],
                         candidate_mask=batch["candidate_mask"],
                     )
-
+                    #每个batch算一次，比如你现在这个 batch 可能是：B = 2
+                    #那这一次 criterion(...) 算出来的 loss，就是这 2 条 impression 组成的这个 batch 的损失。
                     loss = criterion(
-                        outputs["logits"],
-                        batch["labels"],
-                        batch["candidate_mask"],
+                        outputs["logits"],#logits: [B, K]
+                        batch["labels"],#labels: [B, K]
+                        batch["candidate_mask"],#哪些 candidate位置是真实的，哪些只是padding
                     )
                     if not torch.isfinite(loss):
                         raise FloatingPointError(
@@ -623,7 +636,12 @@ def main() -> None:
 
                     global_step += 1
 
-                    loss_weight = get_loss_weight(config.loss_type, batch["candidate_mask"])
+                    loss_weight = get_loss_weight(
+                        config.loss_type,
+                        batch["candidate_mask"],
+                        batch["labels"],
+                    )
+                    #把很多个 batch 的 loss 汇总成一个更合理的 epoch 平均训练 loss。
                     running_loss += loss.item() * loss_weight
                     running_loss_weight += loss_weight
 
