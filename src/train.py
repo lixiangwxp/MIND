@@ -19,9 +19,10 @@ except ImportError:
 
 from dataset import BUCKET_ORDER, build_bucketed_dataloaders, build_dataloader
 from eval import auc_score, brier_score, mrr_score, ndcg_at_k, recall_at_k
-from featuresbaseline import load_or_build_baseline_news_features
+from features import load_or_build_news_features
 from losses import ImpressionPairwiseLoss, ListNetTop, MaskedBCEWithLogitsLoss
 from modelbaseline import BaselineNewsRecModel
+from modelfeature import FeatureNewsRecModel
 
 
 def detect_device() -> str:
@@ -40,13 +41,17 @@ class TrainConfig:
     train_path: Path = Path("data/processed/train_impressions.parquet")
     dev_path: Path = Path("data/processed/dev_impressions.parquet")
     news_id_to_index_path: Path = Path("data/processed/news_id_to_index.json")
-    feature_cache_path: Path = Path("data/processed/baseline_news_features.pt")
-    checkpoint_path: Path = Path("outputs/baseline_best.pt")
+    feature_cache_path: Path = Path("data/processed/news_features_v2.pt")
+    checkpoint_path: Path = Path("outputs/baseline_bce_best.pt")
 
+    model_type: str = "baseline"
     max_title_len: int = 24
-    max_abstract_len: int = 24
+    max_abstract_len: int = 48
     max_entity_len: int = 5
     embedding_dim: int = 128
+    num_transformer_layers: int = 2
+    num_attention_heads: int = 4
+    transformer_ffn_dim: int = 512
     batch_size: int = 8
     bce_short_batch_size: int = 8
     bce_medium_batch_size: int = 4
@@ -80,7 +85,14 @@ class TrainConfig:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the MIND baseline recommender.")
+    parser = argparse.ArgumentParser(description="Train the MIND recommender.")
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["baseline", "feature"],
+        default=None,
+        help="Model architecture to train.",
+    )
     parser.add_argument(
         "--disable-wandb",
         action="store_true",
@@ -115,7 +127,43 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=["bce", "pairwise", "listnet_top"],
         default=None,
-        help="Training loss to use. Default keeps the original BCE baseline.",
+        help="Training loss to use.",
+    )
+    parser.add_argument(
+        "--max-title-len",
+        type=int,
+        default=None,
+        help="Maximum number of title tokens kept in the shared news features.",
+    )
+    parser.add_argument(
+        "--max-abstract-len",
+        type=int,
+        default=None,
+        help="Maximum number of abstract tokens kept in the shared news features.",
+    )
+    parser.add_argument(
+        "--max-entity-len",
+        type=int,
+        default=None,
+        help="Maximum number of entity ids kept in the shared news features.",
+    )
+    parser.add_argument(
+        "--num-transformer-layers",
+        type=int,
+        default=None,
+        help="Number of transformer encoder layers used by the feature model.",
+    )
+    parser.add_argument(
+        "--num-attention-heads",
+        type=int,
+        default=None,
+        help="Number of attention heads used by the feature model.",
+    )
+    parser.add_argument(
+        "--transformer-ffn-dim",
+        type=int,
+        default=None,
+        help="Feed-forward hidden dimension used inside the feature-model transformer blocks.",
     )
     return parser.parse_args()
 
@@ -174,6 +222,10 @@ def build_criterion(loss_type: str) -> torch.nn.Module:
         return ListNetTop()
 
     raise ValueError(f"Unsupported loss type: {loss_type}")
+
+
+def build_checkpoint_path(model_type: str, loss_type: str) -> Path:
+    return Path("outputs") / f"{model_type}_{loss_type}_best.pt"
 
 
 def get_loss_weight(loss_type: str, candidate_mask: torch.Tensor) -> int:
@@ -275,7 +327,7 @@ def init_wandb_run(
 
 @torch.no_grad()
 def evaluate(
-    model: BaselineNewsRecModel,
+    model: torch.nn.Module,
     data_loader,
     criterion: torch.nn.Module,
     loss_type: str,
@@ -370,6 +422,8 @@ def main() -> None:
 
     if args.disable_wandb:
         config.use_wandb = False
+    if args.model_type:
+        config.model_type = args.model_type
     if args.wandb_project:
         config.wandb_project = args.wandb_project
     if args.wandb_entity:
@@ -380,12 +434,25 @@ def main() -> None:
         config.log_interval = args.log_interval
     if args.loss_type:
         config.loss_type = args.loss_type
+    if args.max_title_len is not None:
+        config.max_title_len = args.max_title_len
+    if args.max_abstract_len is not None:
+        config.max_abstract_len = args.max_abstract_len
+    if args.max_entity_len is not None:
+        config.max_entity_len = args.max_entity_len
+    if args.num_transformer_layers is not None:
+        config.num_transformer_layers = args.num_transformer_layers
+    if args.num_attention_heads is not None:
+        config.num_attention_heads = args.num_attention_heads
+    if args.transformer_ffn_dim is not None:
+        config.transformer_ffn_dim = args.transformer_ffn_dim
     if config.log_interval < 1:
         raise ValueError("log_interval must be at least 1")
+    config.checkpoint_path = build_checkpoint_path(config.model_type, config.loss_type)
 
     device = torch.device(config.device)
 
-    features = load_or_build_baseline_news_features(
+    features = load_or_build_news_features(
         cache_path=config.feature_cache_path,
         processed_dir=config.processed_dir,
         max_title_len=config.max_title_len,
@@ -413,23 +480,35 @@ def main() -> None:
         num_workers=config.num_workers,
     )
 
-    model = BaselineNewsRecModel(
-        num_categories=len(features["category_to_index"]),
-        num_subcategories=len(features["subcategory_to_index"]),
-        vocab_size=len(features["token_to_index"]),
-        news_category_ids=features["news_category_ids"],
-        news_subcategory_ids=features["news_subcategory_ids"],
-        news_title_token_ids=features["news_title_token_ids"],
-        news_title_mask=features["news_title_mask"],
-        news_abstract_token_ids=features["news_abstract_token_ids"],
-        news_abstract_mask=features["news_abstract_mask"],
-        num_entities=len(features["entity_to_index"]),
-        news_entity_ids=features["news_entity_ids"],
-        news_entity_mask=features["news_entity_mask"],
-        embedding_dim=config.embedding_dim,
-        use_entities=config.use_entities,
-        dropout=config.dropout,
-    ).to(device)
+    model_kwargs = {
+        "num_categories": len(features["category_to_index"]),
+        "num_subcategories": len(features["subcategory_to_index"]),
+        "vocab_size": len(features["token_to_index"]),
+        "news_category_ids": features["news_category_ids"],
+        "news_subcategory_ids": features["news_subcategory_ids"],
+        "news_title_token_ids": features["news_title_token_ids"],
+        "news_title_mask": features["news_title_mask"],
+        "news_abstract_token_ids": features["news_abstract_token_ids"],
+        "news_abstract_mask": features["news_abstract_mask"],
+        "num_entities": len(features["entity_to_index"]),
+        "news_entity_ids": features["news_entity_ids"],
+        "news_entity_mask": features["news_entity_mask"],
+        "embedding_dim": config.embedding_dim,
+        "use_entities": config.use_entities,
+        "dropout": config.dropout,
+    }
+
+    if config.model_type == "baseline":
+        model = BaselineNewsRecModel(**model_kwargs).to(device)
+    else:
+        model = FeatureNewsRecModel(
+            **model_kwargs,
+            max_title_len=config.max_title_len,
+            max_abstract_len=config.max_abstract_len,
+            num_transformer_layers=config.num_transformer_layers,
+            num_attention_heads=config.num_attention_heads,
+            transformer_ffn_dim=config.transformer_ffn_dim,
+        ).to(device)
 
     criterion = build_criterion(config.loss_type)
     optimizer = AdamW(
@@ -452,26 +531,40 @@ def main() -> None:
     print(f"train samples = {len(train_samples)}")
     print(f"dev samples = {len(dev_samples)}")
     print(f"trainable params = {trainable_params:,}")
+    print(f"model type = {config.model_type}")
     print(f"loss type = {config.loss_type}")
     print(f"use entities = {config.use_entities}")
-    print(f"dev batch size = {config.batch_size}")
-    for bucket_name in BUCKET_ORDER:
-        loader = train_loaders.get(bucket_name)
-        if loader is None:
-            print(f"train bucket[{bucket_name}] samples=0 batch_size={train_bucket_batch_sizes[bucket_name]}")
-            continue
-
-        print(
-            f"train bucket[{bucket_name}] "
-            f"samples={len(loader.dataset)} batch_size={train_bucket_batch_sizes[bucket_name]} "
-            f"steps={len(loader)}"
-        )
+    print(f"feature cache = {config.feature_cache_path}")
+    print(f"checkpoint path = {config.checkpoint_path}")
     print(
-        "lr scheduler = ReduceLROnPlateau("
-        f"mode=min, factor={config.lr_scheduler_factor}, "
-        f"patience={config.lr_scheduler_patience}, min_lr={config.min_lr}"
-        ")"
+        f"feature lengths = title:{config.max_title_len} "
+        f"abstract:{config.max_abstract_len} entity:{config.max_entity_len}"
     )
+    if config.model_type == "feature":
+        print(
+            "feature model = "
+            f"layers:{config.num_transformer_layers} "
+            f"heads:{config.num_attention_heads} "
+            f"ffn:{config.transformer_ffn_dim}"
+        )
+    print(f"dev batch size = {config.batch_size}")
+    # for bucket_name in BUCKET_ORDER:
+    #     loader = train_loaders.get(bucket_name)
+    #     if loader is None:
+    #         print(f"train bucket[{bucket_name}] samples=0 batch_size={train_bucket_batch_sizes[bucket_name]}")
+    #         continue
+
+    #     print(
+    #         f"train bucket[{bucket_name}] "
+    #         f"samples={len(loader.dataset)} batch_size={train_bucket_batch_sizes[bucket_name]} "
+    #         f"steps={len(loader)}"
+    #     )
+    # print(
+    #     "lr scheduler = ReduceLROnPlateau("
+    #     f"mode=min, factor={config.lr_scheduler_factor}, "
+    #     f"patience={config.lr_scheduler_patience}, min_lr={config.min_lr}"
+    #     ")"
+    # )
 
     wandb_run = init_wandb_run(
         config=config,

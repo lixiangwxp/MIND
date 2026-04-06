@@ -102,8 +102,9 @@ class ListNetTop(nn.Module):
         if not valid_impressions.any():
             raise ValueError("No valid impressions found for ListNetTop loss.")
 
-        masked_logits = logits.masked_fill(~valid_mask, float("-inf"))
-        masked_labels = labels.float().masked_fill(~valid_mask, float("-inf"))
+        mask_fill_value = torch.finfo(logits.dtype).min
+        masked_logits = logits.masked_fill(~valid_mask, mask_fill_value)
+        masked_labels = labels.float().masked_fill(~valid_mask, mask_fill_value)
 
         pred_log_probs = F.log_softmax(masked_logits, dim=1).masked_fill(~valid_mask, 0.0)
         target_probs = F.softmax(masked_labels, dim=1).masked_fill(~valid_mask, 0.0)

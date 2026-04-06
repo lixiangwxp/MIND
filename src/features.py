@@ -9,7 +9,7 @@ import torch
 
 PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"
-FEATURE_SCHEMA_VERSION = 2
+FEATURE_SCHEMA_VERSION = 3
 REQUIRED_FEATURE_KEYS = {
     "feature_schema_version",
     "news_category_ids",
@@ -53,20 +53,36 @@ def build_index_mapping(values: list[str], add_unk: bool = False) -> dict[str, i
     return mapping
 
 
+def validate_processed_metadata(processed_dir: str | Path) -> None:
+    meta_path = Path(processed_dir) / "preprocess_meta.json"
+    if not meta_path.exists():
+        return
+
+    metadata = load_json(meta_path)
+    if metadata.get("title_only") is True:
+        raise ValueError(
+            "The processed data was generated with deprecated title_only=true. "
+            "Please rerun src/preprocess.py to regenerate data/processed with full features."
+        )
+
+
 def build_news_feature_tensors(
     news_parquet_path: str | Path,
     news_id_to_index_path: str | Path,
     max_title_len: int = 24,
-    max_abstract_len: int = 24,
+    max_abstract_len: int = 48,
     max_entity_len: int = 5,
 ) -> dict[str, Any]:
     news_df = pd.read_parquet(news_parquet_path)
     news_id_to_index = load_json(news_id_to_index_path)
 
-    if "abstract_tokens" not in news_df.columns:
-        news_df["abstract_tokens"] = "[]"
-    if "entities" not in news_df.columns:
-        news_df["entities"] = "[]"
+    missing_columns = {"title_tokens", "abstract_tokens", "entities"} - set(news_df.columns)
+    if missing_columns:
+        missing_columns_str = ", ".join(sorted(missing_columns))
+        raise ValueError(
+            f"Missing required feature columns in {news_parquet_path}: {missing_columns_str}. "
+            "Please rerun src/preprocess.py to regenerate processed data."
+        )
 
     categories = sorted(news_df["category"].dropna().unique().tolist())
     subcategories = sorted(news_df["subcategory"].dropna().unique().tolist())
@@ -111,11 +127,13 @@ def build_news_feature_tensors(
         news_subcategory_ids[news_idx] = subcategory_to_index.get(row.subcategory, 0)
 
         title_tokens = parse_json_list(row.title_tokens)[:max_title_len]
-        token_ids = [token_to_index.get(token, unk_index) for token in title_tokens]
-
-        if token_ids:
-            news_title_token_ids[news_idx, : len(token_ids)] = torch.tensor(token_ids, dtype=torch.long)
-            news_title_mask[news_idx, : len(token_ids)] = True
+        title_token_ids = [token_to_index.get(token, unk_index) for token in title_tokens]
+        if title_token_ids:
+            news_title_token_ids[news_idx, : len(title_token_ids)] = torch.tensor(
+                title_token_ids,
+                dtype=torch.long,
+            )
+            news_title_mask[news_idx, : len(title_token_ids)] = True
 
         abstract_tokens = parse_json_list(row.abstract_tokens)[:max_abstract_len]
         abstract_token_ids = [token_to_index.get(token, unk_index) for token in abstract_tokens]
@@ -155,13 +173,14 @@ def build_news_feature_tensors(
     }
 
 
-def load_baseline_news_features(
+def load_news_features(
     processed_dir: str | Path = "data/processed",
     max_title_len: int = 24,
-    max_abstract_len: int = 24,
+    max_abstract_len: int = 48,
     max_entity_len: int = 5,
 ) -> dict[str, Any]:
     processed_dir = Path(processed_dir)
+    validate_processed_metadata(processed_dir)
     return build_news_feature_tensors(
         news_parquet_path=processed_dir / "news_dict.parquet",
         news_id_to_index_path=processed_dir / "news_id_to_index.json",
@@ -171,17 +190,17 @@ def load_baseline_news_features(
     )
 
 
-def save_baseline_news_features(
+def save_news_features(
     output_path: str | Path,
     processed_dir: str | Path = "data/processed",
     max_title_len: int = 24,
-    max_abstract_len: int = 24,
+    max_abstract_len: int = 48,
     max_entity_len: int = 5,
 ) -> dict[str, Any]:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    features = load_baseline_news_features(
+    features = load_news_features(
         processed_dir=processed_dir,
         max_title_len=max_title_len,
         max_abstract_len=max_abstract_len,
@@ -191,7 +210,7 @@ def save_baseline_news_features(
     return features
 
 
-def load_saved_baseline_news_features(path: str | Path) -> dict[str, Any]:
+def load_saved_news_features(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     return torch.load(path, map_location="cpu")
 
@@ -218,18 +237,18 @@ def is_feature_cache_compatible(
     return True
 
 
-def load_or_build_baseline_news_features(
+def load_or_build_news_features(
     cache_path: str | Path,
     processed_dir: str | Path = "data/processed",
     max_title_len: int = 24,
-    max_abstract_len: int = 24,
+    max_abstract_len: int = 48,
     max_entity_len: int = 5,
 ) -> dict[str, Any]:
     cache_path = Path(cache_path)
 
     if cache_path.exists():
         try:
-            features = load_saved_baseline_news_features(cache_path)
+            features = load_saved_news_features(cache_path)
         except Exception:
             features = None
         else:
@@ -241,7 +260,7 @@ def load_or_build_baseline_news_features(
             ):
                 return features
 
-    return save_baseline_news_features(
+    return save_news_features(
         output_path=cache_path,
         processed_dir=processed_dir,
         max_title_len=max_title_len,

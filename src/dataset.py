@@ -138,9 +138,6 @@ def build_dataloader(
     label_pad_value: float = -100.0,
     drop_last: bool = False,
 ) -> DataLoader:
-    if torch is None:
-        raise ImportError("torch is required to build a DataLoader. Please install torch first.")
-
     dataset = ImpressionDataset(
         impression_samples=impression_samples,
         news_id_to_index=news_id_to_index,

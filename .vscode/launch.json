@@ -5,6 +5,52 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "MIND: Feature + Pairwise 单步看 train 数据流",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/opt/anaconda3/envs/mind/bin/python",
+            "program": "${workspaceFolder}/src/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "stopOnEntry": false,
+            "args": [
+                "--disable-wandb",
+                "--model-type",
+                "feature",
+                "--loss-type",
+                "pairwise",
+                "--log-interval",
+                "1"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
+        },
+        {
+            "name": "MIND: Feature + Pairwise 调试 dev evaluate 流程",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/opt/anaconda3/envs/mind/bin/python",
+            "program": "${workspaceFolder}/src/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "stopOnEntry": false,
+            "args": [
+                "--disable-wandb",
+                "--model-type",
+                "feature",
+                "--loss-type",
+                "pairwise",
+                "--log-interval",
+                "10000"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
+        },
+        {
             "name": "MIND: 单步看 train 数据流",
             "type": "debugpy",
             "request": "launch",

@@ -108,14 +108,14 @@ def _truncate_history(history_ids: list[str], max_history_len: int | None) -> li
 def build_news_dict(
     news_df: pd.DataFrame,
     max_title_len: int | None = 24,
+    max_abstract_len: int | None = 48,
     max_entity_len: int | None = 5,
-    title_only: bool = True,
 ) -> dict[str, dict[str, Any]]:
     news_dict: dict[str, dict[str, Any]] = {}
 
     for row in news_df.itertuples(index=False):
         title_tokens = _truncate_prefix(tokenize(row.title), max_title_len)
-        abstract_tokens = [] if title_only else _truncate_prefix(tokenize(row.abstract), max_title_len)
+        abstract_tokens = _truncate_prefix(tokenize(row.abstract), max_abstract_len)
         entity_ids = _truncate_prefix(
             parse_entities(row.title_entities, row.abstract_entities),
             max_entity_len,
@@ -263,8 +263,8 @@ def save_processed_artifacts(
     output_dir: str | Path,
     max_history_len: int = 50,
     max_title_len: int = 24,
+    max_abstract_len: int = 48,
     max_entity_len: int = 5,
-    title_only: bool = True,
     train_negative_sample_size: int | None = None,
     train_negative_sample_ratio: int | None = 8,
     train_negative_sample_max_size: int | None = 24,
@@ -282,8 +282,8 @@ def save_processed_artifacts(
     news_dict = build_news_dict(
         merged_news_df,
         max_title_len=max_title_len,
+        max_abstract_len=max_abstract_len,
         max_entity_len=max_entity_len,
-        title_only=title_only,
     )
 
     train_behaviors_df = load_behaviors_frame(train_dir / "behaviors.tsv")
@@ -327,8 +327,8 @@ def save_processed_artifacts(
         "output_dir": str(output_dir),
         "max_history_len": max_history_len,
         "max_title_len": max_title_len,
+        "max_abstract_len": max_abstract_len,
         "max_entity_len": max_entity_len,
-        "title_only": title_only,
         "train_negative_sample_size": train_negative_sample_size,
         "train_negative_sample_ratio": train_negative_sample_ratio,
         "train_negative_sample_max_size": train_negative_sample_max_size,
@@ -383,15 +383,16 @@ def main() -> None:
         help="Keep at most N title tokens per news article.",
     )
     parser.add_argument(
+        "--max-abstract-len",
+        type=int,
+        default=48,
+        help="Keep at most N abstract tokens per news article.",
+    )
+    parser.add_argument(
         "--max-entity-len",
         type=int,
         default=5,
         help="Keep at most N entity ids per news article.",
-    )
-    parser.add_argument(
-        "--title-only",
-        action="store_true",
-        help="Ignore abstract tokens and keep only title tokens.",
     )
     parser.add_argument(
         "--train-negative-sample-size",
@@ -431,8 +432,8 @@ def main() -> None:
         output_dir=args.output_dir,
         max_history_len=args.max_history_len,
         max_title_len=args.max_title_len,
+        max_abstract_len=args.max_abstract_len,
         max_entity_len=args.max_entity_len,
-        title_only=args.title_only,
         train_negative_sample_size=args.train_negative_sample_size,
         train_negative_sample_ratio=args.train_negative_sample_ratio,
         train_negative_sample_max_size=args.train_negative_sample_max_size,
